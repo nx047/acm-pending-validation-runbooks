@@ -1,76 +1,215 @@
-﻿# ACM DNS Validation Checker - RunCommand 버전 요구사항
+# ACM DNS Validation Checker - Run Command Version
 
-## 개요
+## Background
 
-이 버전은 SSM Automation의 `aws:runCommand` action을 사용하여 대상 EC2 instance에서 DNS 진단 스크립트를 실행합니다.
+AWS Certificate Manager (ACM) DNS validation looks simple on the surface: ACM gives you a CNAME record, you add it to DNS, and the certificate should move from `Pending validation` to `Issued`.
 
-DNS 조회는 EC2 내부의 `dig` 명령을 사용합니다. 따라서 이 버전에서는 `dig`가 필수입니다.
+In real environments, the failure cases are less obvious. A certificate can stay pending because the CNAME was created in the wrong hosted zone, because the value is slightly different, because another record exists at the same validation name, because CAA records block Amazon from issuing the certificate, or because the registered domain is delegated to different name servers than the DNS zone the operator is editing.
 
-## 실행 방식
+I built this runbook to make those cases easier to diagnose from AWS Systems Manager. Instead of asking an engineer to manually copy ACM validation records and run several DNS commands, the automation collects the certificate metadata, checks the public DNS state, ranks the likely root cause, and returns a remediation message that can be acted on.
 
-- SSM Automation document가 `AWS-RunShellScript`를 호출합니다.
-- 대상 EC2 instance에서 Python script가 실행됩니다.
-- ACM 조회는 대상 EC2 instance에 설치된 `aws cli`를 통해 수행됩니다.
-- DNS 조회는 대상 EC2 instance에 설치된 `dig`를 통해 수행됩니다.
+This version intentionally uses **SSM Run Command** and runs the diagnostic script on an EC2 instance. That choice keeps the DNS behavior close to what an operator would check manually with `dig`, and it avoids packaging external Python DNS libraries into the SSM Automation runtime. The tradeoff is that a prepared EC2 instance is required.
 
-## 입력 파라미터
+## What It Checks
 
-- `AutomationAssumeRole`: SSM Automation이 사용할 IAM role ARN
-- `CertificateArn`: 진단할 ACM certificate ARN
-- `InstanceId`: 명령을 실행할 EC2 instance ID
+- Validates the ACM certificate ARN format.
+- Calls `acm:DescribeCertificate` in the certificate's region.
+- Exits early for non-DNS validation methods.
+- Exits early when the certificate is already `ISSUED` or `EXPIRED`.
+- Checks whether each ACM DNS validation CNAME exists.
+- Compares the public CNAME value with the ACM expected value.
+- Detects TXT records at the exact ACM CNAME validation name.
+- Checks whether CAA records authorize Amazon CA issuance.
+- Compares parent NS delegation with authoritative NS records.
+- Handles multi-domain and SAN certificates by checking all `DomainValidationOptions`.
+- Marks renewal-related failures when ACM returns `RenewalSummary`.
 
-## 필수 사전조건
+## Architecture
 
-대상 EC2 instance에는 다음 조건이 필요합니다.
+```text
+User / Operator
+      |
+      v
+SSM Automation Document
+      |
+      v
+aws:runCommand
+      |
+      v
+AWS-RunShellScript on target EC2 instance
+      |
+      +--> aws acm describe-certificate
+      +--> dig CNAME / TXT / CAA / NS
+      |
+      v
+JSON result returned through SSM Automation output
+```
 
-- SSM Agent online 상태
-- 인터넷 또는 public DNS resolver 접근 가능
-- `python3` 설치
-- `aws cli` 설치 및 실행 가능
-- `dig` 설치
-  - Amazon Linux/RHEL 계열: `bind-utils`
-  - Ubuntu/Debian 계열: `dnsutils`
+## Files
 
-## IAM 권한
+| File | Purpose |
+| --- | --- |
+| `acm_dns_validation_checker_runcommand.yaml` | SSM Automation document that runs the diagnostic script through `aws:runCommand`. |
+| `README.md` | Usage guide for the Run Command version. |
 
-Automation role 또는 대상 instance profile에는 다음 권한이 필요합니다.
+## Prerequisites
 
-- `ssm:SendCommand`
-- `ssm:GetCommandInvocation`
-- `ec2:DescribeInstances`
-- `acm:DescribeCertificate`
+### Target EC2 Instance
 
-환경에 따라 SSM document 실행을 위한 추가 Systems Manager 권한이 필요할 수 있습니다.
+The target instance must have:
 
-## 진단 항목
+- SSM Agent installed and online.
+- Network access to AWS APIs.
+- Access to public DNS resolvers.
+- `python3`.
+- AWS CLI.
+- `dig`.
 
-- Certificate ARN 형식 검증
-- ACM `DescribeCertificate` 호출
-- EMAIL validation 인증서 조기 종료
-- `ISSUED` 또는 `EXPIRED` 상태 조기 종료
-- CNAME validation record 존재 여부 확인
-- CNAME value mismatch 확인
-- TXT conflict 확인
-- CAA record에 의한 Amazon CA 차단 여부 확인
-- NS delegation과 authoritative NS 불일치 확인
-- SAN 인증서의 모든 `DomainValidationOptions` 순회
-- renewal failure 여부 표시
+Install `dig` if needed:
 
-## 장점
+```bash
+# Amazon Linux / RHEL
+sudo yum install -y bind-utils
 
-- `dig`를 사용하므로 DNS 조회 결과가 운영자가 수동으로 확인하는 방식과 유사합니다.
-- parent nameserver에 직접 질의하는 NS delegation 점검을 구현하기 쉽습니다.
-- 외부 Python dependency packaging이 필요 없습니다.
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y dnsutils
+```
 
-## 단점
+### IAM Permissions
 
-- EC2 instance가 필요합니다.
-- instance에 `dig`, `aws cli`, `python3`가 설치되어 있어야 합니다.
-- Automation role 또는 instance profile 권한 범위가 커집니다.
-- 진단 결과가 대상 EC2의 네트워크 환경에 영향을 받을 수 있습니다.
+The SSM Automation role and/or the target instance profile must allow the actions used by this runbook.
 
-## 권장 사용 상황
+Minimum required permissions:
 
-- 이미 운영용 bastion 또는 utility EC2가 있는 환경
-- `dig` 기반 DNS 질의를 그대로 재현하고 싶은 경우
-- parent delegation NS 확인까지 비교적 정확히 수행하고 싶은 경우
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "acm:DescribeCertificate",
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation",
+        "ec2:DescribeInstances"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Depending on how the automation document is created and executed in your account, additional Systems Manager permissions may be required, such as `ssm:StartAutomationExecution` and `ssm:GetAutomationExecution`.
+
+## Deploy the SSM Document
+
+Create the Automation document:
+
+```bash
+aws ssm create-document \
+  --name ACM-DNS-Validation-Checker-RunCommand \
+  --document-type Automation \
+  --document-format YAML \
+  --content file://acm_dns_validation_checker_runcommand.yaml
+```
+
+Update the document after editing the YAML:
+
+```bash
+aws ssm update-document \
+  --name ACM-DNS-Validation-Checker-RunCommand \
+  --document-version '$LATEST' \
+  --document-format YAML \
+  --content file://acm_dns_validation_checker_runcommand.yaml
+```
+
+Set the latest version as default:
+
+```bash
+aws ssm update-document-default-version \
+  --name ACM-DNS-Validation-Checker-RunCommand \
+  --document-version '$LATEST'
+```
+
+## Run the Automation
+
+Start a diagnosis:
+
+```bash
+aws ssm start-automation-execution \
+  --document-name ACM-DNS-Validation-Checker-RunCommand \
+  --parameters '{
+    "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/YourAutomationRole"],
+    "CertificateArn": ["arn:aws:acm:ap-southeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"],
+    "InstanceId": ["i-0123456789abcdef0"]
+  }'
+```
+
+Get the execution result:
+
+```bash
+aws ssm get-automation-execution \
+  --automation-execution-id <automation-execution-id>
+```
+
+The important output is exposed from the `RunDNSChecks.ResultPayload` step.
+
+## Example Output
+
+```json
+{
+  "RootCause": "CNAME_MISSING",
+  "Summary": "CNAME not found at _abc.example.com.",
+  "AllIssues": "CNAME_MISSING(example.com)",
+  "Remediation": "Create CNAME: _abc.example.com. -> _xyz.acm-validations.aws.",
+  "CertificateArn": "arn:aws:acm:ap-southeast-1:123456789012:certificate/...",
+  "Status": "PENDING_VALIDATION",
+  "Domain": "example.com",
+  "IsFailed": "False",
+  "IsRenewal": "False"
+}
+```
+
+## Root Cause Priority
+
+When multiple issues are found, the runbook chooses the highest-priority issue as the primary `RootCause`.
+
+| Priority | Root Cause | Meaning |
+| --- | --- | --- |
+| 1 | `CNAME_MISSING` | ACM validation CNAME does not exist in public DNS. |
+| 2 | `CNAME_MISMATCH` | CNAME exists, but the value does not match ACM's expected value. |
+| 3 | `TXT_CONFLICT` | TXT exists at the exact CNAME validation name. |
+| 4 | `CAA_BLOCKING` | CAA records do not authorize Amazon CA issuance. |
+| 5 | `NS_INCONSISTENCY` | Parent delegation and authoritative NS records differ. |
+| 6 | `RENEWAL_FAILURE` | Certificate appears to be in renewal flow and DNS may have changed. |
+
+## Known Limitations
+
+- This version requires an EC2 instance. That is the biggest tradeoff of the Run Command design.
+- The instance must already have `python3`, AWS CLI, and `dig`.
+- The result depends on the target instance's network path and DNS resolver behavior.
+- The base domain detection currently uses the last two DNS labels, so domains such as `example.co.uk` need a public suffix aware parser in a future version.
+- The ARN validation currently supports the standard `aws` partition. GovCloud and China partitions would need an expanded ARN pattern.
+- DNS errors are normalized into empty results in several places, so some timeout or resolver failure cases may appear as missing records.
+
+## Why This Version Uses Run Command
+
+The long-term cleaner design is an `aws:executeScript` Automation document that does not require EC2. However, `aws:executeScript` would need a reliable DNS library strategy, such as bundled `dnspython`, and it would need careful handling for authoritative DNS queries.
+
+For this version, Run Command was a practical first implementation because:
+
+- `dig` gives transparent DNS results that are familiar to operators.
+- Parent delegation checks are easier to express with direct `dig` queries.
+- No third-party Python dependency package is required.
+- The script can be tested on an instance the same way it runs in automation.
+
+## Future Improvements
+
+- Build a v2 using `aws:executeScript` so no EC2 instance is required.
+- Replace last-two-label base domain parsing with public suffix list support.
+- Return a more structured JSON array for all issues instead of a pipe-separated string.
+- Preserve DNS timeout, SERVFAIL, and NXDOMAIN as distinct diagnostic states.
+- Support `aws-us-gov` and `aws-cn` ACM ARN partitions.
+- Add automated test cases with mocked ACM and DNS responses.
+
