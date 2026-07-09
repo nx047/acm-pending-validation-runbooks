@@ -4,9 +4,9 @@
 
 AWS Certificate Manager (ACM) DNS validation looks simple on the surface: ACM gives you a CNAME record, you add it to DNS, and the certificate should move from `Pending validation` to `Issued`.
 
-In real environments, the failure cases are less obvious. A certificate can stay pending because the CNAME was created in the wrong hosted zone, because the value is slightly different, because another record exists at the same validation name, because CAA records block Amazon from issuing the certificate, or because the registered domain is delegated to different name servers than the DNS zone the operator is editing.
+In real environments, many users do not immediately realize that they must create the ACM-provided CNAME record in their DNS provider. Even when they know a CNAME is required, they often need to move back and forth between ACM, Route 53 or another DNS provider, public DNS lookup tools, and AWS documentation to understand what is wrong.
 
-I built this runbook to make those cases easier to diagnose from AWS Systems Manager. Instead of asking an engineer to manually copy ACM validation records and run several DNS commands, the automation collects the certificate metadata, checks the public DNS state, ranks the likely root cause, and returns a remediation message that can be acted on.
+I built this runbook to reduce that manual investigation. Instead of making an engineer check each DNS concept one by one, the automation collects the certificate metadata, checks the most likely DNS failure points, identifies the most likely root cause, and returns a remediation message that can be acted on.
 
 This version intentionally uses **SSM Run Command** and runs the diagnostic script on an EC2 instance. That choice keeps the DNS behavior close to what an operator would check manually with `dig`, and it avoids packaging external Python DNS libraries into the SSM Automation runtime. The tradeoff is that a prepared EC2 instance is required.
 
@@ -26,24 +26,32 @@ This version intentionally uses **SSM Run Command** and runs the diagnostic scri
 
 ## Architecture
 
-```text
-User / Operator
-      |
-      v
-SSM Automation Document
-      |
-      v
-aws:runCommand
-      |
-      v
-AWS-RunShellScript on target EC2 instance
-      |
-      +--> aws acm describe-certificate
-      +--> dig CNAME / TXT / CAA / NS
-      |
-      v
-JSON result returned through SSM Automation output
+```mermaid
+flowchart TD
+    A["User / Operator"] --> B["SSM Automation Document"]
+    B --> C["aws:runCommand"]
+    C --> D["AWS-RunShellScript on Target EC2"]
+    D --> E["aws acm describe-certificate"]
+    D --> F["dig CNAME / TXT / CAA / NS"]
+    E --> G["Diagnostic Python Script"]
+    F --> G
+    G --> H["Rank Root Cause"]
+    H --> I["JSON Result"]
+    I --> J["SSM Automation Output<br/>RunDNSChecks.ResultPayload"]
 ```
+
+## Main Possible Causes
+
+When multiple issues are found, the runbook chooses the most important issue as the primary `RootCause`.
+
+| Order | Root Cause | Meaning |
+| --- | --- | --- |
+| 1 | `CNAME_MISSING` | ACM validation CNAME does not exist in public DNS. |
+| 2 | `CNAME_MISMATCH` | CNAME exists, but the value does not match ACM's expected value. |
+| 3 | `TXT_CONFLICT` | TXT exists at the exact CNAME validation name. |
+| 4 | `CAA_BLOCKING` | CAA records do not authorize Amazon CA issuance. |
+| 5 | `NS_INCONSISTENCY` | Parent delegation and authoritative NS records differ. |
+| 6 | `RENEWAL_FAILURE` | Certificate appears to be in renewal flow and DNS may have changed. |
 
 ## Files
 
@@ -64,6 +72,18 @@ The target instance must have:
 - `python3`.
 - AWS CLI.
 - `dig`.
+
+Recommended lightweight target instance:
+
+```text
+Instance type: t3.micro
+OS: Amazon Linux 2023
+Storage: 8 GiB gp3
+Network: outbound access to AWS APIs and public DNS
+Packages: python3, aws cli, bind-utils
+```
+
+The script is not CPU or memory intensive. A small utility instance is enough as long as SSM Agent is online and `dig` is available.
 
 Install `dig` if needed:
 
@@ -91,7 +111,6 @@ Minimum required permissions:
       "Action": [
         "acm:DescribeCertificate",
         "ssm:SendCommand",
-        "ssm:GetCommandInvocation",
         "ec2:DescribeInstances"
       ],
       "Resource": "*"
@@ -104,7 +123,7 @@ Depending on how the automation document is created and executed in your account
 
 ## Deploy the SSM Document
 
-Create the Automation document:
+Create the Automation document from the Systems Manager console, or use the CLI if you prefer:
 
 ```bash
 aws ssm create-document \
@@ -114,46 +133,19 @@ aws ssm create-document \
   --content file://acm_dns_validation_checker_runcommand.yaml
 ```
 
-Update the document after editing the YAML:
-
-```bash
-aws ssm update-document \
-  --name ACM-DNS-Validation-Checker-RunCommand \
-  --document-version '$LATEST' \
-  --document-format YAML \
-  --content file://acm_dns_validation_checker_runcommand.yaml
-```
-
-Set the latest version as default:
-
-```bash
-aws ssm update-document-default-version \
-  --name ACM-DNS-Validation-Checker-RunCommand \
-  --document-version '$LATEST'
-```
-
 ## Run the Automation
 
-Start a diagnosis:
+You can run the document from the Systems Manager Automation console.
 
-```bash
-aws ssm start-automation-execution \
-  --document-name ACM-DNS-Validation-Checker-RunCommand \
-  --parameters '{
-    "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/YourAutomationRole"],
-    "CertificateArn": ["arn:aws:acm:ap-southeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"],
-    "InstanceId": ["i-0123456789abcdef0"]
-  }'
-```
+Required inputs:
 
-Get the execution result:
+| Parameter | Description |
+| --- | --- |
+| `AutomationAssumeRole` | IAM role ARN used by SSM Automation. |
+| `CertificateArn` | ACM certificate ARN to diagnose. |
+| `InstanceId` | Target EC2 instance where the script runs. |
 
-```bash
-aws ssm get-automation-execution \
-  --automation-execution-id <automation-execution-id>
-```
-
-The important output is exposed from the `RunDNSChecks.ResultPayload` step.
+After the execution finishes, check the `RunDNSChecks.ResultPayload` output.
 
 ## Example Output
 
@@ -170,19 +162,6 @@ The important output is exposed from the `RunDNSChecks.ResultPayload` step.
   "IsRenewal": "False"
 }
 ```
-
-## Root Cause Priority
-
-When multiple issues are found, the runbook chooses the highest-priority issue as the primary `RootCause`.
-
-| Priority | Root Cause | Meaning |
-| --- | --- | --- |
-| 1 | `CNAME_MISSING` | ACM validation CNAME does not exist in public DNS. |
-| 2 | `CNAME_MISMATCH` | CNAME exists, but the value does not match ACM's expected value. |
-| 3 | `TXT_CONFLICT` | TXT exists at the exact CNAME validation name. |
-| 4 | `CAA_BLOCKING` | CAA records do not authorize Amazon CA issuance. |
-| 5 | `NS_INCONSISTENCY` | Parent delegation and authoritative NS records differ. |
-| 6 | `RENEWAL_FAILURE` | Certificate appears to be in renewal flow and DNS may have changed. |
 
 ## Known Limitations
 
@@ -210,6 +189,4 @@ For this version, Run Command was a practical first implementation because:
 - Replace last-two-label base domain parsing with public suffix list support.
 - Return a more structured JSON array for all issues instead of a pipe-separated string.
 - Preserve DNS timeout, SERVFAIL, and NXDOMAIN as distinct diagnostic states.
-- Support `aws-us-gov` and `aws-cn` ACM ARN partitions.
 - Add automated test cases with mocked ACM and DNS responses.
-
