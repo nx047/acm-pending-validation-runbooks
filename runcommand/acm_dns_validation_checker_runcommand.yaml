@@ -1,0 +1,403 @@
+﻿# ACM DNS Validation Checker RunCommand 버전
+#
+# 목적:
+# - ACM 인증서가 PendingValidation, Failed, Timed out, Renewal failure 상태에 머무르는 원인을 진단합니다.
+# - public DNS 기준으로 CNAME, TXT conflict, CAA, NS delegation 문제를 확인합니다.
+#
+# 주의:
+# - 이 초안은 aws:runCommand 기반입니다.
+# - 즉, SSM Automation이 직접 Python을 실행하는 구조가 아니라 대상 EC2 instance에서 shell script를 실행합니다.
+# - 따라서 InstanceId, SSM Agent, internet access, dig, python3, aws cli가 필요합니다.
+# - 순수 aws:executeScript 기반 요구사항과는 실행 모델이 다르므로 최종 문서에서는 둘 중 하나로 통일해야 합니다.
+
+description: |
+  ACM DNS Validation Checker - Diagnoses why an ACM certificate is stuck in
+  PendingValidation/Failed/Timed-out state by performing public DNS checks.
+
+  Checks:
+  - CNAME validation record existence and value matching
+  - TXT record conflict at the CNAME validation name
+  - CAA authorization for Amazon CA
+  - NS delegation consistency
+
+  Prerequisites:
+  - Target instance: SSM Agent online, internet access, dig, python3, aws cli
+  - Automation role: acm:DescribeCertificate, ssm:SendCommand, ec2:DescribeInstances
+
+schemaVersion: "0.3"
+
+# AutomationAssumeRole은 SSM Automation이 사용할 IAM role입니다.
+# 현재 초안은 aws:runCommand를 사용하므로 ACM 조회 권한뿐 아니라 SSM SendCommand 관련 권한도 필요합니다.
+assumeRole: "{{ AutomationAssumeRole }}"
+
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: "(Required) IAM role ARN with acm:DescribeCertificate and ssm:SendCommand."
+    default: ""
+
+  # 진단 대상 ACM 인증서 ARN입니다.
+  # 스크립트 내부에서 ARN 형식을 검증하고, ARN에서 region을 추출해 ACM API 호출에 사용합니다.
+  CertificateArn:
+    type: String
+    description: "(Required) ACM certificate ARN to diagnose."
+
+  # 이 초기 초안은 대상 EC2 instance에서 dig/aws cli/python3를 실행합니다.
+  # aws:executeScript 방식으로 바꾸면 이 parameter는 제거할 수 있습니다.
+  InstanceId:
+    type: String
+    description: "(Required) EC2 instance ID (SSM Agent online, internet access required)."
+
+outputs:
+  # RunCommand stdout에 출력된 JSON 문자열을 Automation output으로 노출합니다.
+  - RunDNSChecks.ResultPayload
+
+mainSteps:
+  - name: RunDNSChecks
+    action: aws:runCommand
+    timeoutSeconds: 180
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - "{{ InstanceId }}"
+      Parameters:
+        commands:
+          - |
+            #!/usr/bin/env python3
+            """ACM DNS Validation Checker - runs on EC2 instance via SSM RunCommand."""
+
+            import json
+            import re
+            import subprocess
+            import sys
+
+            CERT_ARN = "{{ CertificateArn }}"
+
+            # ACM DNS validation에서 Amazon CA 허용 여부를 판단할 때 사용하는 issuer 후보입니다.
+            AMAZON_ISSUERS = ["amazon.com", "amazontrust.com", "awstrust.com", "amazonaws.com"]
+
+
+            def run(cmd, timeout=15):
+                """Run an external command and return stdout. Errors are normalized to an empty string."""
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                    return r.stdout.strip() if r.returncode == 0 else ""
+                except Exception:
+                    return ""
+
+
+            def dig_short(name, rtype):
+                """Return dig +short results for a record type."""
+                out = run(["dig", "+short", "+time=5", "+tries=2", name, rtype])
+                return [line for line in out.split("\n") if line] if out else []
+
+
+            def dig_answer(name, rtype):
+                """Return dig answer-section rows for records that need richer parsing, such as CAA."""
+                out = run(["dig", "+noall", "+answer", "+time=5", "+tries=2", name, rtype])
+                return [line for line in out.split("\n") if line] if out else []
+
+
+            def norm(name):
+                """Normalize DNS names for comparison: case-insensitive and trailing-dot-insensitive."""
+                return name.lower().strip().rstrip(".") if name else ""
+
+
+            def caa_issuer(value):
+                """Extract the issuer domain from a CAA issue/issuewild value."""
+                issuer = value.strip().strip('"').split(";", 1)[0].strip().lower().rstrip(".")
+                return issuer
+
+
+            def caa_authorizes_amazon(values):
+                """Return True only when the CAA issuer exactly matches an Amazon issuer."""
+                return any(caa_issuer(value) in AMAZON_ISSUERS for value in values)
+
+
+            def output_and_exit(data):
+                """Print a single JSON payload so SSM Automation can capture it as step output."""
+                print(json.dumps(data, ensure_ascii=False))
+                sys.exit(0)
+
+
+            # ------------------------------------------------------------------
+            # 1. Input validation
+            # ------------------------------------------------------------------
+            # Expected format: arn:aws:acm:<region>:<12-digit-account-id>:certificate/<certificate-id>
+            # Note: this regex handles the standard aws partition. If GovCloud or China partition is needed,
+            # extend arn:aws to arn:aws-us-gov or arn:aws-cn as appropriate.
+            m = re.match(r"^arn:aws:acm:([a-z0-9-]+):(\d{12}):certificate/([a-f0-9-]+)$", CERT_ARN)
+            if not m:
+                output_and_exit({
+                    "RootCause": "INVALID_INPUT",
+                    "Summary": "Invalid ARN format",
+                    "Remediation": "Format: arn:aws:acm:<region>:<account>:certificate/<id>",
+                })
+
+            region = m.group(1)
+
+            # ------------------------------------------------------------------
+            # 2. Local prerequisite check
+            # ------------------------------------------------------------------
+            # Because this initial version relies on dig, verify it exists on the target instance.
+            if not run(["which", "dig"]):
+                output_and_exit({
+                    "RootCause": "TOOL_MISSING",
+                    "Summary": "dig not found",
+                    "Remediation": "Install bind-utils or dnsutils on the target instance.",
+                })
+
+            # ------------------------------------------------------------------
+            # 3. Describe ACM certificate
+            # ------------------------------------------------------------------
+            # The region extracted from the ARN is used to avoid querying the wrong ACM regional endpoint.
+            raw = run([
+                "aws", "acm", "describe-certificate",
+                "--certificate-arn", CERT_ARN,
+                "--region", region,
+                "--output", "json",
+            ])
+            if not raw:
+                output_and_exit({
+                    "RootCause": "API_ERROR",
+                    "Summary": "DescribeCertificate failed. Check permissions/region.",
+                    "Remediation": "Ensure the execution role has acm:DescribeCertificate and the ARN region is correct.",
+                })
+
+            cert = json.loads(raw).get("Certificate", {})
+            status = cert.get("Status", "")
+            domain_name = cert.get("DomainName", "")
+            dvos = cert.get("DomainValidationOptions", [])
+            val_method = dvos[0].get("ValidationMethod", "NONE") if dvos else "NONE"
+
+            # Failed certificates should still go through DNS checks so the user can fix the root cause first.
+            is_failed = status == "FAILED" or any(d.get("ValidationStatus") == "FAILED" for d in dvos)
+
+            # RenewalSummary usually indicates the certificate was previously issued and is now in renewal flow.
+            is_renewal = "RenewalSummary" in cert
+
+            # ------------------------------------------------------------------
+            # 4. Early exits for unsupported or already terminal states
+            # ------------------------------------------------------------------
+            if val_method != "DNS":
+                output_and_exit({
+                    "RootCause": "NOT_DNS",
+                    "Summary": f"Uses {val_method}, not DNS.",
+                    "Remediation": "This tool only supports DNS validation.",
+                    "CertificateArn": CERT_ARN,
+                    "Status": status,
+                    "Domain": domain_name,
+                })
+
+            if status in ("ISSUED", "EXPIRED"):
+                output_and_exit({
+                    "RootCause": "NOT_PENDING",
+                    "Summary": f"Certificate is {status}.",
+                    "Remediation": "No DNS validation action is needed for this status.",
+                    "CertificateArn": CERT_ARN,
+                    "Status": status,
+                    "Domain": domain_name,
+                })
+
+            issues = []
+
+            # ------------------------------------------------------------------
+            # 5. Per-domain DNS checks
+            # ------------------------------------------------------------------
+            # SAN certificates can have multiple DomainValidationOptions. Check every entry, not just DomainName.
+            for dvo in dvos:
+                dn = dvo.get("DomainName", "")
+                rr = dvo.get("ResourceRecord", {})
+                rr_name = rr.get("Name", "")
+                rr_value = rr.get("Value", "")
+
+                if not rr_name or not rr_value:
+                    issues.append({
+                        "type": "CNAME_MISSING",
+                        "p": 1,
+                        "domain": dn,
+                        "detail": "No ResourceRecord in certificate response. Validation record may not be generated yet.",
+                        "name": "",
+                        "value": "",
+                    })
+                    continue
+
+                # 5-1. CNAME existence and value match
+                cname_answers = dig_short(rr_name.rstrip("."), "CNAME")
+                if not cname_answers:
+                    issues.append({
+                        "type": "CNAME_MISSING",
+                        "p": 1,
+                        "domain": dn,
+                        "detail": f"CNAME not found at {rr_name}",
+                        "name": rr_name,
+                        "value": rr_value,
+                    })
+                else:
+                    actual = norm(cname_answers[0])
+                    expected = norm(rr_value)
+                    if actual != expected:
+                        issues.append({
+                            "type": "CNAME_MISMATCH",
+                            "p": 2,
+                            "domain": dn,
+                            "detail": f"CNAME value does not exactly match. Expected={expected}, Actual={actual}",
+                            "name": rr_name,
+                            "value": rr_value,
+                            "actual": actual,
+                        })
+
+                # 5-2. TXT coexistence check
+                # A CNAME owner name should not normally have other record types at the exact same name.
+                txt_answers = dig_short(rr_name.rstrip("."), "TXT")
+                if txt_answers:
+                    issues.append({
+                        "type": "TXT_CONFLICT",
+                        "p": 3,
+                        "domain": dn,
+                        "detail": f"TXT record exists at the exact ACM CNAME validation name {rr_name}. Verify whether it is in the same hosted zone before removing it. TXT values: {txt_answers}",
+                    })
+
+                # 5-3. CAA check
+                # Walk up from the requested domain toward the parent domains until CAA is found or root is reached.
+                check_d = dn.lstrip("*.").rstrip(".")
+                is_wc = dn.startswith("*.")
+                current = check_d
+                while current and "." in current:
+                    caa_lines = dig_answer(current, "CAA")
+                    if not caa_lines:
+                        parts = current.split(".", 1)
+                        current = parts[1] if len(parts) > 1 else ""
+                        continue
+
+                    issue_vals = []
+                    issuewild_vals = []
+                    for line in caa_lines:
+                        fields = line.split()
+                        if len(fields) >= 7 and fields[3] == "CAA":
+                            tag = fields[5].lower()
+                            val = " ".join(fields[6:]).strip('"').lower()
+                            if tag == "issue":
+                                issue_vals.append(val)
+                            elif tag == "issuewild":
+                                issuewild_vals.append(val)
+
+                    # For wildcard domains, issuewild overrides issue when present.
+                    # If issuewild is absent, wildcard issuance falls back to issue records.
+                    relevant_tag = "issuewild" if (is_wc and issuewild_vals) else "issue"
+                    relevant = issuewild_vals if relevant_tag == "issuewild" else issue_vals
+                    if relevant:
+                        ok = caa_authorizes_amazon(relevant)
+                        if not ok:
+                            issues.append({
+                                "type": "CAA_BLOCKING",
+                                "p": 4,
+                                "domain": dn,
+                                "detail": f"CAA at {current} does not authorize Amazon CA for tag {relevant_tag}. Values: {relevant}. Expected exact issuer domain in {AMAZON_ISSUERS}",
+                            })
+                    break
+
+            # ------------------------------------------------------------------
+            # 6. NS consistency check per base domain
+            # ------------------------------------------------------------------
+            # This initial implementation uses the last two labels as the base domain.
+            # For domains such as example.co.uk, use a public suffix aware parser in the final version.
+            base_domains = set()
+            for dvo in dvos:
+                d = dvo.get("DomainName", "").lstrip("*.").rstrip(".")
+                parts = d.split(".")
+                if len(parts) >= 2:
+                    base_domains.add(".".join(parts[-2:]))
+
+            for bd in base_domains:
+                parts = bd.split(".")
+                if len(parts) < 2:
+                    continue
+
+                parent = ".".join(parts[1:])
+                parent_ns_list = dig_short(parent, "NS")
+                if not parent_ns_list:
+                    continue
+
+                # Query the parent nameserver for delegation information.
+                ns_server = parent_ns_list[0].rstrip(".")
+                auth_out = run(["dig", "+noall", "+authority", "+time=5", "@" + ns_server, bd, "NS"])
+                delegated = set()
+                for line in auth_out.split("\n"):
+                    fields = line.split()
+                    if len(fields) >= 5 and fields[3] == "NS":
+                        delegated.add(fields[4].lower().rstrip("."))
+
+                if not delegated:
+                    continue
+
+                auth_ns = set(n.lower().rstrip(".") for n in dig_short(bd, "NS"))
+                if auth_ns and delegated != auth_ns:
+                    issues.append({
+                        "type": "NS_INCONSISTENCY",
+                        "p": 5,
+                        "domain": bd,
+                        "detail": f"Delegation={sorted(delegated)}, Auth={sorted(auth_ns)}",
+                    })
+
+            # Renewal marker is lower priority than direct DNS configuration issues.
+            if is_renewal:
+                issues.append({
+                    "type": "RENEWAL_FAILURE",
+                    "p": 6,
+                    "domain": domain_name,
+                    "detail": "Renewal failure - DNS may have changed since original issuance.",
+                })
+
+            issues.sort(key=lambda x: x["p"])
+
+            # ------------------------------------------------------------------
+            # 7. Build final result payload
+            # ------------------------------------------------------------------
+            if not issues:
+                result = {
+                    "RootCause": "NO_ISSUE_FOUND",
+                    "Summary": "All DNS checks passed. Validation may still be propagating.",
+                    "Remediation": "Wait for DNS propagation. Contact AWS Support if the certificate remains pending after the expected validation window.",
+                }
+            else:
+                steps = []
+                for issue in issues:
+                    t = issue["type"]
+                    if t == "CNAME_MISSING":
+                        steps.append(f"Create CNAME: {issue['name']} -> {issue['value']}")
+                    elif t == "CNAME_MISMATCH":
+                        steps.append(f"Verify CNAME {issue['name']} exactly matches ACM expected value {issue['value']}. Current value: {issue.get('actual', 'unknown')}")
+                    elif t == "TXT_CONFLICT":
+                        steps.append(f"Verify TXT record at the exact ACM CNAME validation name for {issue['domain']}. If it is in the same hosted zone, remove it so the CNAME can exist alone.")
+                    elif t == "CAA_BLOCKING":
+                        steps.append(f"Allow Amazon CA in CAA for {issue['domain']}, for example: 0 issue \"amazon.com\"")
+                    elif t == "NS_INCONSISTENCY":
+                        steps.append(f"Fix NS for {issue['domain']}: registrar delegation must match the authoritative DNS host")
+                    elif t == "RENEWAL_FAILURE":
+                        steps.append(f"Verify DNS validation records still exist for renewal domain {issue['domain']}")
+
+                if is_failed:
+                    steps.append("After fixing DNS, delete the failed certificate and request a new certificate.")
+
+                result = {
+                    "RootCause": issues[0]["type"],
+                    "Summary": issues[0]["detail"],
+                    "AllIssues": " | ".join(f"{issue['type']}({issue['domain']})" for issue in issues),
+                    "Remediation": " | ".join(steps),
+                }
+
+            result["CertificateArn"] = CERT_ARN
+            result["Status"] = status
+            result["Domain"] = domain_name
+            result["IsFailed"] = str(is_failed)
+            result["IsRenewal"] = str(is_renewal)
+
+            print(json.dumps(result, ensure_ascii=False))
+    outputs:
+      - Name: ResultPayload
+        Selector: $.Output
+        Type: String
+
+
+
