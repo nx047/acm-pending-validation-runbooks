@@ -169,7 +169,7 @@ After the execution finishes, check the `RunDNSChecks.ResultPayload` output.
 - The instance must already have `python3`, AWS CLI, and `dig`.
 - The result depends on the target instance's network path and DNS resolver behavior.
 - The base domain detection currently uses the last two DNS labels, so domains such as `example.co.uk` need a public suffix aware parser in a future version.
-- The ARN validation currently supports the standard `aws` partition. GovCloud and China partitions would need an expanded ARN pattern.
+- The ARN validation currently supports the standard `aws` partition used by this project scope.
 - DNS errors are normalized into empty results in several places, so some timeout or resolver failure cases may appear as missing records.
 
 ## Why This Version Uses Run Command
