@@ -8,7 +8,7 @@ In real environments, many users do not immediately realize that they must creat
 
 I built this runbook to reduce that manual investigation. Instead of making an engineer check each DNS concept one by one, the automation collects the certificate metadata, checks the most likely DNS failure points, identifies the most likely root cause, and returns a remediation message that can be acted on.
 
-This version intentionally uses **SSM Run Command** and runs the diagnostic script on an EC2 instance. That choice keeps the DNS behavior close to what an operator would check manually with `dig`, and it avoids packaging external Python DNS libraries into the SSM Automation runtime. The tradeoff is that a prepared EC2 instance is required.
+This version intentionally uses **SSM Run Command** and runs the diagnostic script on a Linux EC2 instance. That choice keeps the DNS behavior close to what an operator would check manually with `dig`, and it avoids packaging external Python DNS libraries into the SSM Automation runtime. The tradeoff is that a prepared Linux EC2 instance is required.
 
 ## What It Checks
 
@@ -59,12 +59,17 @@ When multiple issues are found, the runbook chooses the most important issue as 
 | --- | --- |
 | `acm_dns_validation_checker_runcommand.yaml` | SSM Automation document that runs the diagnostic script through `aws:runCommand`. |
 | `README.md` | Usage guide for the Run Command version. |
+| `TEST_SCENARIOS.md` | GitHub-safe manual test scenarios using provider-neutral test subdomains. |
 
 ## Prerequisites
 
 ### Target EC2 Instance
 
-The target instance must have:
+This Run Command version is designed for **Linux EC2 instances**. It uses `AWS-RunShellScript`, a Python shebang, and the `dig` command.
+
+Windows Server instances are not supported by this document as written. A Windows version would need a separate `AWS-RunPowerShellScript` document and DNS checks rewritten around Windows-friendly tooling such as `Resolve-DnsName`, `nslookup`, or a bundled DNS library.
+
+The target Linux instance must have:
 
 - SSM Agent installed and online.
 - Network access to AWS APIs.
@@ -165,7 +170,8 @@ After the execution finishes, check the `RunDNSChecks.ResultPayload` output.
 
 ## Known Limitations
 
-- This version requires an EC2 instance. That is the biggest tradeoff of the Run Command design.
+- This version requires a Linux EC2 instance. That is the biggest tradeoff of the Run Command design.
+- Windows Server is not supported by this document because it uses `AWS-RunShellScript` and `dig`.
 - The instance must already have `python3`, AWS CLI, and `dig`.
 - The result depends on the target instance's network path and DNS resolver behavior.
 - The base domain detection currently uses the last two DNS labels, so domains such as `example.co.uk` need a public suffix aware parser in a future version.
