@@ -1,14 +1,14 @@
-﻿# ACM DNS Validation Checker RunCommand 버전
+# ACM DNS Validation Checker RunCommand version
 #
-# 목적:
-# - ACM 인증서가 PendingValidation, Failed, Timed out, Renewal failure 상태에 머무르는 원인을 진단합니다.
-# - public DNS 기준으로 CNAME, TXT conflict, CAA, NS delegation 문제를 확인합니다.
+# Purpose:
+# - Diagnose why an ACM certificate remains in PendingValidation, Failed, Timed out, or Renewal failure state.
+# - Check CNAME, TXT conflict, CAA, and NS delegation using public DNS.
 #
-# 주의:
-# - 이 초안은 aws:runCommand 기반입니다.
-# - 즉, SSM Automation이 직접 Python을 실행하는 구조가 아니라 대상 EC2 instance에서 shell script를 실행합니다.
-# - 따라서 InstanceId, SSM Agent, internet access, dig, python3, aws cli가 필요합니다.
-# - 순수 aws:executeScript 기반 요구사항과는 실행 모델이 다르므로 최종 문서에서는 둘 중 하나로 통일해야 합니다.
+# Notes:
+# - This draft is based on aws:runCommand.
+# - SSM Automation does not run Python directly; it runs a shell script on the target EC2 instance.
+# - Therefore, InstanceId, SSM Agent, internet access, dig, python3, and aws cli are required.
+# - This execution model differs from a pure aws:executeScript version.
 
 description: |
   ACM DNS Validation Checker - Diagnoses why an ACM certificate is stuck in
@@ -26,8 +26,8 @@ description: |
 
 schemaVersion: "0.3"
 
-# AutomationAssumeRole은 SSM Automation이 사용할 IAM role입니다.
-# 현재 초안은 aws:runCommand를 사용하므로 ACM 조회 권한뿐 아니라 SSM SendCommand 관련 권한도 필요합니다.
+# AutomationAssumeRole is the IAM role used by SSM Automation.
+# This aws:runCommand draft requires SSM SendCommand permissions as well as ACM read permissions.
 assumeRole: "{{ AutomationAssumeRole }}"
 
 parameters:
@@ -36,21 +36,21 @@ parameters:
     description: "(Required) IAM role ARN with acm:DescribeCertificate and ssm:SendCommand."
     default: ""
 
-  # 진단 대상 ACM 인증서 ARN입니다.
-  # 스크립트 내부에서 ARN 형식을 검증하고, ARN에서 region을 추출해 ACM API 호출에 사용합니다.
+  # ACM certificate ARN to diagnose.
+  # The script validates the ARN format and extracts the region for ACM API calls.
   CertificateArn:
     type: String
     description: "(Required) ACM certificate ARN to diagnose."
 
-  # 이 초기 초안은 대상 Linux EC2 instance에서 dig/aws cli/python3를 실행합니다.
-  # Windows Server는 현재 문서에서 지원하지 않습니다. Windows용으로는 AWS-RunPowerShellScript 기반 문서가 필요합니다.
-  # aws:executeScript 방식으로 바꾸면 이 parameter는 제거할 수 있습니다.
+  # This draft runs dig/aws cli/python3 on the target Linux EC2 instance.
+  # Windows Server is not supported by this document. A Windows version would need AWS-RunPowerShellScript.
+  # This parameter can be removed in a future aws:executeScript version.
   InstanceId:
     type: String
     description: "(Required) Linux EC2 instance ID (SSM Agent online, internet access required). Windows Server is not supported by this document."
 
 outputs:
-  # RunCommand stdout에 출력된 JSON 문자열을 Automation output으로 노출합니다.
+  # Expose the JSON string printed to RunCommand stdout as an Automation output.
   - RunDNSChecks.ResultPayload
 
 mainSteps:
@@ -74,7 +74,7 @@ mainSteps:
 
             CERT_ARN = "{{ CertificateArn }}"
 
-            # ACM DNS validation에서 Amazon CA 허용 여부를 판단할 때 사용하는 issuer 후보입니다.
+            # Candidate issuers used to determine whether CAA authorizes Amazon CA issuance.
             AMAZON_ISSUERS = ["amazon.com", "amazontrust.com", "awstrust.com", "amazonaws.com"]
 
 
@@ -399,6 +399,7 @@ mainSteps:
       - Name: ResultPayload
         Selector: $.Output
         Type: String
+
 
 
 
