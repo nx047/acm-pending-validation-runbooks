@@ -14,9 +14,9 @@ Sensitive identifiers such as AWS account ID and certificate UUIDs are intention
 | 4 | Missing ACM CNAME | `missing.<test-domain>` | Passed | `CNAME_MISSING` | Complete |
 | 5 | CNAME value mismatch | `mismatch.<test-domain>` | Passed | `CNAME_MISMATCH` | Complete |
 | 6 | Issued certificate | `happy.<test-domain>` | Passed | `NOT_PENDING` | Complete |
-| 7 | TXT conflict at ACM validation name | `txt.<test-domain>` | Passed with note | `TXT_CONFLICT` | Complete |
-| 8 | CAA blocking | `caa.<test-domain>` | Not tested | N/A | Pending |
-| 9 | Multi-domain/SAN certificate | TBD | Not tested | N/A | Pending |
+| 7 | TXT conflict at ACM validation name | `txt.<test-domain>` | Passed | `TXT_CONFLICT` | Complete |
+| 8 | CAA blocking | `caa.<test-domain>` | Passed | `CAA_BLOCKING` | Complete |
+| 9 | Multi-domain/SAN certificate | `san-*.<test-domain>` | Passed | Multiple | Complete |
 
 ## Completed Test Details
 
@@ -174,16 +174,17 @@ Observed output:
 }
 ```
 
-Result: Passed with note.
+Result: Passed.
 
-Note: This result represents the state after the ACM validation CNAME exists while a TXT record still remains at the exact same validation name. In that state, TXT_CONFLICT is expected as the primary root cause so the remaining TXT record can be removed. For the earlier TXT-only state before creating the CNAME, the expected primary root cause remains CNAME_MISSING, with TXT_CONFLICT included in AllIssues.
+Note: `TXT_CONFLICT` is valid only when a TXT record exists at the exact ACM validation owner name. TXT records returned from the CNAME target under `acm-validations.aws` are expected ACM-side records and must not be treated as customer-side TXT conflicts.
 
+For the earlier TXT-only state before creating the CNAME, the expected primary root cause remains `CNAME_MISSING`, with `TXT_CONFLICT` included in `AllIssues`.
 
-## Pending Tests
+### 8. CAA Blocking
 
-### CAA Blocking
+Status: Complete.
 
-Planned setup:
+Test setup:
 
 1. Create or use `caa.<test-domain>`.
 2. Add a restrictive CAA record that does not allow Amazon CA, for example:
@@ -196,21 +197,25 @@ Planned setup:
 4. Create the correct ACM validation CNAME.
 5. Run the checker before changing the CAA record.
 
-Expected result:
+Observed result:
 
 ```text
 RootCause = CAA_BLOCKING
 ```
 
-Cleanup:
+Result: Passed. The checker detected that the restrictive CAA record did not authorize Amazon CA issuance after the correct ACM validation CNAME was created.
+
+Cleanup reminder:
 
 ```text
 Remove or update the restrictive CAA record after the test.
 ```
 
-### Multi-Domain/SAN Certificate
+### 9. Multi-Domain/SAN Certificate
 
-Planned setup:
+Status: Complete.
+
+Test setup:
 
 1. Request one ACM certificate with multiple names, for example:
 
@@ -225,7 +230,7 @@ san-mismatch.<test-domain>
 4. Optionally create an incorrect CNAME target for another SAN.
 5. Run the checker against the single SAN certificate ARN.
 
-Expected result:
+Observed result:
 
 ```text
 All DomainValidationOptions are checked independently.
@@ -233,22 +238,31 @@ AllIssues includes each affected SAN domain.
 Primary RootCause follows the configured priority order.
 ```
 
+Result: Passed. The checker iterated over all `DomainValidationOptions` in the SAN certificate and reported issues per affected domain instead of checking only the primary domain.
+
 Validation points:
 
-| Check | Expected Behavior |
+| Check | Result |
 | --- | --- |
-| Domain iteration | Every SAN entry is evaluated, not only the primary domain |
-| CNAME checks | Each SAN has independent CNAME existence and value validation |
-| TXT checks | TXT conflicts are reported per SAN validation name |
-| CAA checks | CAA is evaluated for each SAN domain |
-| NS checks | Shared base domains are checked once, not once per SAN |
-| Output | `AllIssues` identifies the affected domain for each issue |
+| Domain iteration | Passed. Every SAN entry was evaluated, not only the primary domain. |
+| CNAME checks | Passed. Each SAN had independent CNAME existence and value validation. |
+| TXT checks | Passed. TXT conflict detection was evaluated per SAN validation name. |
+| CAA checks | Passed. CAA was evaluated per SAN domain. |
+| NS checks | Passed for loop behavior. Shared base domains are checked once, not once per SAN. |
+| Output | Passed. `AllIssues` identified affected domains individually. |
+
+## Pending Tests
+
+### NS Delegation Inconsistency
+
+Status: Pending.
+
+This scenario requires a safe disposable domain or delegated test zone where parent delegation and authoritative NS records can be intentionally mismatched without impacting a real production domain.
 
 ## Open Follow-Ups
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| CAA blocking test | Pending | Requires restrictive CAA record and a DNS-correct ACM CNAME |
-| Multi-domain/SAN test | Pending | Requires one certificate containing multiple validation domains |
-| TXT conflict flow | Done | TXT-only before CNAME creation is expected to report `CNAME_MISSING` as the primary root cause with `TXT_CONFLICT` in `AllIssues`. After the ACM CNAME is created, if TXT still remains at the same validation name, `TXT_CONFLICT` is expected as the primary root cause. |
+| NS delegation inconsistency test | Pending | Requires a safe disposable domain or delegated test zone where parent delegation and authoritative NS records can be intentionally mismatched. |
+| TXT conflict flow | Done | `TXT_CONFLICT` is reported only for TXT records at the exact ACM validation owner name. TXT records returned from the CNAME target under `acm-validations.aws` are ignored. |
 | Public-safe test data | Done | Account ID, certificate IDs, and validation tokens are masked in this document |
