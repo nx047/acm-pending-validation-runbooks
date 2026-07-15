@@ -249,8 +249,15 @@ mainSteps:
                         })
 
                 # 5-2. TXT coexistence check
-                # A CNAME owner name should not normally have other record types at the exact same name.
-                txt_answers = dig_short(rr_name.rstrip("."), "TXT")
+                # Only TXT records whose owner name exactly matches the ACM validation name are conflicts.
+                # dig TXT can follow a CNAME and return TXT records from the ACM target under
+                # acm-validations.aws; those target-side TXT records are expected and must be ignored.
+                txt_lines = dig_answer(rr_name.rstrip("."), "TXT")
+                txt_answers = []
+                for line in txt_lines:
+                    fields = line.split()
+                    if len(fields) >= 5 and fields[3] == "TXT" and norm(fields[0]) == norm(rr_name):
+                        txt_answers.append(" ".join(fields[4:]))
                 if txt_answers:
                     issues.append({
                         "type": "TXT_CONFLICT",
