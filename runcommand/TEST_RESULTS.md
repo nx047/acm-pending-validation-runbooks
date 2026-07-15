@@ -176,13 +176,12 @@ Observed output:
 
 Result: Passed with note.
 
-Note: `runcommand/TEST_SCENARIOS.md` currently documents this scenario as `RootCause=CNAME_MISSING` with `AllIssues` including `TXT_CONFLICT`. The observed result uses `TXT_CONFLICT` as the primary root cause. Confirm whether the expected scenario document or the implementation priority should be updated.
+Note: This result represents the state after the ACM validation CNAME exists while a TXT record still remains at the exact same validation name. In that state, TXT_CONFLICT is expected as the primary root cause so the remaining TXT record can be removed. For the earlier TXT-only state before creating the CNAME, the expected primary root cause remains CNAME_MISSING, with TXT_CONFLICT included in AllIssues.
+
 
 ## Pending Tests
 
 ### CAA Blocking
-
-Status: Not tested.
 
 Planned setup:
 
@@ -210,8 +209,6 @@ Remove or update the restrictive CAA record after the test.
 ```
 
 ### Multi-Domain/SAN Certificate
-
-Status: Not tested.
 
 Planned setup:
 
@@ -253,5 +250,5 @@ Validation points:
 | --- | --- | --- |
 | CAA blocking test | Pending | Requires restrictive CAA record and a DNS-correct ACM CNAME |
 | Multi-domain/SAN test | Pending | Requires one certificate containing multiple validation domains |
-| TXT conflict expected result | Needs decision | Observed `TXT_CONFLICT`; existing scenario document expects primary `CNAME_MISSING` plus `TXT_CONFLICT` in `AllIssues` |
+| TXT conflict flow | Done | TXT-only before CNAME creation is expected to report `CNAME_MISSING` as the primary root cause with `TXT_CONFLICT` in `AllIssues`. After the ACM CNAME is created, if TXT still remains at the same validation name, `TXT_CONFLICT` is expected as the primary root cause. |
 | Public-safe test data | Done | Account ID, certificate IDs, and validation tokens are masked in this document |
