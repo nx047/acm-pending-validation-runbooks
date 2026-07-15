@@ -78,17 +78,18 @@ The target Linux instance must have:
 - AWS CLI.
 - `dig`.
 
-Recommended lightweight target instance:
+Tested lightweight target instance:
 
 ```text
 Instance type: t3.micro
 OS: Amazon Linux 2023
 Storage: 8 GiB gp3
-Network: outbound access to AWS APIs and public DNS
+Network: outbound access to AWS Systems Manager, ACM API endpoints, and public DNS
+SSM: SSM Agent online and visible as a managed instance
 Packages: python3, aws cli, bind-utils
 ```
 
-The script is not CPU or memory intensive. A small utility instance is enough as long as SSM Agent is online and `dig` is available.
+The script is not CPU or memory intensive. A small utility instance is enough as long as SSM Agent can communicate with Systems Manager and `dig` is available.
 
 Install `dig` if needed:
 
@@ -103,28 +104,24 @@ sudo apt-get install -y dnsutils
 
 ### IAM Permissions
 
-The SSM Automation role and/or the target instance profile must allow the actions used by this runbook.
+This Run Command version uses two execution principals: the target EC2 instance profile and the SSM Automation role.
 
-Minimum required permissions:
+The target EC2 instance profile needs permissions to:
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "acm:DescribeCertificate",
-        "ssm:SendCommand",
-        "ec2:DescribeInstances"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
+- Register with and receive commands from AWS Systems Manager.
+- Run the diagnostic script through SSM Run Command.
+- Call `acm:DescribeCertificate` from the instance, because the script runs on the instance and invokes the AWS CLI.
 
-Depending on how the automation document is created and executed in your account, additional Systems Manager permissions may be required, such as `ssm:StartAutomationExecution` and `ssm:GetAutomationExecution`.
+In testing, the instance profile used `AmazonSSMManagedInstanceCore` plus a small custom policy that allowed `acm:DescribeCertificate`.
+
+The SSM Automation role needs permissions to:
+
+- Send commands to the target instance.
+- Discover or describe managed instance information.
+- List and inspect command execution results.
+- Optionally call `acm:DescribeCertificate`, depending on how the runbook is extended.
+
+In testing, the Automation role allowed the relevant SSM Run Command actions, such as sending commands and reading command invocation results.
 
 ## Deploy the SSM Document
 
