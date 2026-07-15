@@ -99,6 +99,12 @@ mainSteps:
                 return [line for line in out.split("\n") if line] if out else []
 
 
+            def dig_answer_at(server, name, rtype):
+                """Return answer-section rows from a specific nameserver."""
+                out = run(["dig", "+noall", "+answer", "+time=5", "+tries=2", "@" + server, name, rtype])
+                return [line for line in out.split("\n") if line] if out else []
+
+
             def norm(name):
                 """Normalize DNS names for comparison: case-insensitive and trailing-dot-insensitive."""
                 return name.lower().strip().rstrip(".") if name else ""
@@ -250,9 +256,18 @@ mainSteps:
 
                 # 5-2. TXT coexistence check
                 # Only TXT records whose owner name exactly matches the ACM validation name are conflicts.
-                # dig TXT can follow a CNAME and return TXT records from the ACM target under
-                # acm-validations.aws; those target-side TXT records are expected and must be ignored.
-                txt_lines = dig_answer(rr_name.rstrip("."), "TXT")
+                # Query the domain's authoritative nameservers directly for TXT only, so recursive
+                # resolver CNAME-following does not turn ACM target-side TXT records under
+                # acm-validations.aws into false TXT_CONFLICT issues.
+                txt_lines = []
+                txt_base_parts = dn.lstrip("*.").rstrip(".").split(".")
+                txt_base_domain = ".".join(txt_base_parts[-2:]) if len(txt_base_parts) >= 2 else dn.rstrip(".")
+                for ns in dig_short(txt_base_domain, "NS"):
+                    txt_lines.extend(dig_answer_at(ns.rstrip("."), rr_name.rstrip("."), "TXT"))
+                if not txt_lines:
+                    # Fallback keeps the checker useful if authoritative NS discovery fails.
+                    # Owner-name filtering below still ignores TXT records returned from a followed CNAME target.
+                    txt_lines = dig_answer(rr_name.rstrip("."), "TXT")
                 txt_answers = []
                 for line in txt_lines:
                     fields = line.split()
